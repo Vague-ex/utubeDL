@@ -132,7 +132,7 @@
                                 <p class="text-muted mt-2">Fetching video info...</p>
                             </div>
                         </div>
-                        
+
                         <div id="progressSection" style="display: none;" class="mb-4">
                             <div class="progress" style="height: 25px;">
                                 <div id="progressBar" class="progress-bar progress-bar-striped progress-bar-animated"
@@ -140,7 +140,7 @@
                             </div>
                             <p id="progressText" class="text-center text-muted mt-2 small">Starting download...</p>
                         </div>
-                        
+
                         <div class="row mb-4">
                             <div class="col-md-6">
                                 <label class="form-label fw-bold">Format</label>
@@ -186,15 +186,17 @@
         // Check backend connection on load
         async function checkBackendConnection() {
             try {
-                const response = await fetch(`${BACKEND_URL}/get-video-info`, {
-                    method: 'POST',
+                const response = await fetch(`${BACKEND_URL}/health`, {
+                    method: 'GET',
                     headers: {
-                        'Content-Type': 'application/json',
                         'ngrok-skip-browser-warning': 'true'
-                    },
-                    body: JSON.stringify({ url: '' })
+                    }
                 });
-                setConnectionStatus(true);
+                if (response.ok) {
+                    setConnectionStatus(true);
+                } else {
+                    setConnectionStatus(false);
+                }
             } catch (error) {
                 setConnectionStatus(false);
             }
@@ -349,17 +351,22 @@
                 : document.getElementById('videoQualityType').value;
             const btn = document.getElementById('convertBtn');
             const statusArea = document.getElementById('statusArea');
+            const progressSection = document.getElementById('progressSection');
+            const progressBar = document.getElementById('progressBar');
+            const progressText = document.getElementById('progressText');
+
             if (!finalUrl) return;
 
             btn.disabled = true;
-            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span> Processing...';
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span> Starting...';
             statusArea.style.display = 'none';
+            progressSection.style.display = 'block';
+            progressBar.style.width = '0%';
+            progressBar.textContent = '0%';
 
             try {
-                const backendUrl = `${BACKEND_URL}/convert`;
-                showStatus('Converting your ' + format.toUpperCase() + '...', 'info');
-
-                const response = await fetch(backendUrl, {
+                // Start the job
+                const startResponse = await fetch(`${BACKEND_URL}/start-job`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -368,43 +375,91 @@
                     body: JSON.stringify({ url: finalUrl, format: format, quality: quality })
                 });
 
-                if (!response.ok) {
-                    const errorData = await response.json();
-                    throw new Error(errorData.error || "Server Error");
+                if (!startResponse.ok) {
+                    const errorData = await startResponse.json();
+                    throw new Error(errorData.error || "Failed to start job");
                 }
 
-                const blob = await response.blob();
-                const downloadUrl = window.URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = downloadUrl;
+                const jobData = await startResponse.json();
+                const jobId = jobData.job_id;
 
-                let filename = `download.${format}`;
+                let jobComplete = false;
+                let pollCount = 0;
+                const maxPolls = 600;
+                while (!jobComplete && pollCount < maxPolls) {
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                    pollCount++;
 
-                const customFilename = response.headers.get('X-Filename');
-                if (customFilename) {
-                    filename = customFilename;
-                } else {
-                    const contentDisp = response.headers.get('Content-Disposition');
-                    if (contentDisp) {
-                        const match = contentDisp.match(/filename\s*=\s*(?:"([^"]*)"|([^;\s]*))/);;
-                        if (match && (match[1] || match[2])) {
-                            filename = match[1] || match[2];
+                    const statusResponse = await fetch(`${BACKEND_URL}/job-status/${jobId}`, {
+                        headers: {
+                            'ngrok-skip-browser-warning': 'true'
                         }
+                    });
+
+                    if (!statusResponse.ok) {
+                        throw new Error("Failed to check job status");
+                    }
+
+                    const job = await statusResponse.json();
+                    const percent = parseInt(job.percent) || 0;
+
+                    progressBar.style.width = percent + '%';
+                    progressBar.textContent = percent + '%';
+
+                    if (job.status === 'downloading') {
+                        progressText.textContent = `Downloading... ${percent}%`;
+                    } else if (job.status === 'converting') {
+                        progressText.textContent = 'Converting and encoding...';
+                    } else if (job.status === 'ready') {
+                        jobComplete = true;
+                        progressBar.style.width = '100%';
+                        progressBar.textContent = '100%';
+                        progressText.textContent = 'Download complete!';
+
+                        // Download the file
+                        const downloadResponse = await fetch(`${BACKEND_URL}/download-file/${jobId}`, {
+                            headers: {
+                                'ngrok-skip-browser-warning': 'true'
+                            }
+                        });
+
+                        if (!downloadResponse.ok) {
+                            throw new Error("Failed to download file");
+                        }
+
+                        const blob = await downloadResponse.blob();
+                        const downloadUrl = window.URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = downloadUrl;
+
+                        let filename = `download.${format}`;
+                        const customFilename = downloadResponse.headers.get('X-Filename');
+                        if (customFilename) {
+                            filename = customFilename;
+                        }
+
+                        a.download = filename;
+                        document.body.appendChild(a);
+                        a.click();
+                        a.remove();
+                        window.URL.revokeObjectURL(downloadUrl);
+
+                        showStatus('✓ Download started! File: ' + filename, 'success');
+                    } else if (job.status === 'error') {
+                        throw new Error(job.error || "Processing error");
                     }
                 }
 
-                a.download = filename;
-                document.body.appendChild(a);
-                a.click();
-                a.remove();
-                window.URL.revokeObjectURL(downloadUrl);
-                showStatus('✓ Download started! File: ' + filename, 'success');
+                if (!jobComplete) {
+                    throw new Error("Job timeout - processing took too long");
+                }
 
             } catch (error) {
                 showStatus("Error: " + error.message, "danger");
             } finally {
                 btn.disabled = false;
                 btn.innerHTML = '<i class="bi bi-download me-2"></i> Convert & Download';
+                progressSection.style.display = 'none';
             }
         }
         function showStatus(msg, type) {
@@ -421,4 +476,3 @@
 </body>
 
 </html>
-
